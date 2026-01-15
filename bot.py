@@ -1,350 +1,218 @@
 import os
-import time
 import asyncio
-import re
-import aiosqlite
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from config import BOT_TOKEN
-from database import init_db
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+import aiosqlite
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN not found in environment variables")
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-waiting = set()
-pairs = {}
-rating_targets = {}
+# =========================
+# GLOBAL STATE (TEMP)
+# =========================
 
-#############################
-# Helper functions
-#############################
+search_queue = []
+active_chats = {}        # user_id -> partner_id
+user_searching = set()   # users currently searching
 
-async def now_seconds():
-    return int(time.time())
+# =========================
+# DATABASE INIT (MINIMAL)
+# =========================
 
-async def user_exists(uid):
-    async with aiosqlite.connect("botdata.db") as db:
-        await db.execute("INSERT OR IGNORE INTO users(user_id) VALUES (?)", (uid,))
-        await db.commit()
-
-async def get_user_info(uid):
-    async with aiosqlite.connect("botdata.db") as db:
-        async with db.execute("SELECT * FROM users WHERE user_id=?", (uid,)) as cur:
-            return await cur.fetchone()
-
-async def is_ghost_banned(uid):
-    info = await get_user_info(uid)
-    if not info:
-        return False
-    ban_until = info[6]  # ghost_ban_until
-    if ban_until and ban_until > await now_seconds():
-        return True
-    return False
-
-async def set_ghost_ban(uid, days=3):
-    ban_until = await now_seconds() + (days * 24 * 3600)
-    async with aiosqlite.connect("botdata.db") as db:
-        await db.execute("UPDATE users SET ghost_ban_until=? WHERE user_id=?", (ban_until, uid))
-        await db.commit()
-
-async def add_rating(uid, score):
-    async with aiosqlite.connect("botdata.db") as db:
-        await db.execute("INSERT OR IGNORE INTO users(user_id) VALUES (?)", (uid,))
+async def init_db():
+    async with aiosqlite.connect("bot.db") as db:
         await db.execute("""
-            UPDATE users
-            SET rating_sum = rating_sum + ?, rating_count = rating_count + 1
-            WHERE user_id = ?
-        """, (score, uid))
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            gender TEXT,
+            first_start INTEGER DEFAULT 1
+        )
+        """)
         await db.commit()
 
-async def get_avg_rating(uid):
-    async with aiosqlite.connect("botdata.db") as db:
-        async with db.execute("SELECT rating_sum, rating_count FROM users WHERE user_id=?", (uid,)) as cur:
-            row = await cur.fetchone()
-    if not row or row[1] == 0:
-        return 0
-    return row[0] / row[1]
+# =========================
+# HELPERS
+# =========================
 
-async def log_chat(uid, partner, mtype, content):
-    async with aiosqlite.connect("botdata.db") as db:
+async def is_first_start(user_id: int) -> bool:
+    async with aiosqlite.connect("bot.db") as db:
+        cur = await db.execute("SELECT first_start FROM users WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        return row is None or row[0] == 1
+
+async def mark_started(user_id: int):
+    async with aiosqlite.connect("bot.db") as db:
         await db.execute("""
-            INSERT INTO chats(user_id, partner_id, timestamp, message_type, content)
-            VALUES (?, ?, ?, ?, ?)
-        """, (uid, partner, await now_seconds(), mtype, content))
+        INSERT INTO users (user_id, first_start)
+        VALUES (?, 0)
+        ON CONFLICT(user_id) DO UPDATE SET first_start=0
+        """, (user_id,))
         await db.commit()
 
-#############################
-# Matching logic
-#############################
+async def set_gender(user_id: int, gender: str):
+    async with aiosqlite.connect("bot.db") as db:
+        await db.execute("""
+        INSERT INTO users (user_id, gender)
+        VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET gender=?
+        """, (user_id, gender, gender))
+        await db.commit()
 
-async def try_match(uid):
-    # Remove ghost banned
-    if await is_ghost_banned(uid):
-        return None
-
-    # Attempt prioritized matching for premium
-    user = await get_user_info(uid)
-    preferred_gender = user[2] if user else None
-    user_rating = await get_avg_rating(uid)
-
-    candidate = None
-    best_score = -1
-
-    for other in list(waiting):
-        if other == uid:
-            continue
-
-        other_info = await get_user_info(other)
-        # Ghost banned skip
-        if await is_ghost_banned(other):
-            continue
-
-        # Not recent partner if possible
-        if user and other_info and other_info[7] == uid:
-            continue
-
-        other_rating = await get_avg_rating(other)
-        match_gender_ok = True
-
-        if preferred_gender:
-            match_gender_ok = (other_info and other_info[1] == preferred_gender)
-
-        if user[5] == 1:  # Premium
-            score = other_rating if match_gender_ok else other_rating / 2
-        else:
-            score = 0
-
-        if score > best_score:
-            best_score = score
-            candidate = other
-
-    if candidate:
-        waiting.remove(candidate)
-        pairs[uid] = candidate
-        pairs[candidate] = uid
-        return candidate
-
-    return None
-
-#############################
-# Commands
-#############################
+# =========================
+# /START
+# =========================
 
 @dp.message(Command("start"))
-async def start(message: types.Message):
-    uid = message.from_user.id
-    await user_exists(uid)
-    await message.answer("Welcome! Use /find to search for a partner.")
+async def start_cmd(message: types.Message):
+    user_id = message.from_user.id
 
-@dp.message(Command("setgender"))
-async def set_gender(message: types.Message):
-    parts = message.text.split()
-    if len(parts) != 2:
-        await message.answer("Usage: /setgender <male/female/other>")
-        return
-    uid = message.from_user.id
-    gender = parts[1]
-    async with aiosqlite.connect("botdata.db") as db:
-        await db.execute("UPDATE users SET gender=? WHERE user_id=?", (gender, uid))
-        await db.commit()
-    await message.answer(f"Your gender has been set to {gender}.")
+    if await is_first_start(user_id):
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="♂ Male", callback_data="gender_male"),
+             InlineKeyboardButton(text="♀ Female", callback_data="gender_female")]
+        ])
 
-@dp.message(Command("setpref"))
-async def set_pref(message: types.Message):
-    parts = message.text.split()
-    if len(parts) != 2:
-        await message.answer("Usage: /setpref <male/female/other>")
-        return
+        await message.answer(
+            "👋 Welcome to Pairly\n\n"
+            "Here you can talk to strangers anonymously.\n"
+            "You may encounter unfiltered content. Admins monitor chats.\n\n"
+            "🌟 Premium gives:\n"
+            "• Better matches\n"
+            "• High-rated partners\n"
+            "• Gender preference\n"
+            "• Link sharing\n"
+            "• Faster matching\n\n"
+            "🌻 Earn Sunflowers by:\n"
+            "• Good ratings\n"
+            "• Maintaining streaks\n"
+            "• Playing games\n\n"
+            "By using /find or /next you agree to the rules.\n\n"
+            "Please select your gender:",
+            reply_markup=kb
+        )
+        await mark_started(user_id)
+    else:
+        await find_partner(message)
+
+# =========================
+# GENDER CALLBACK
+# =========================
+
+@dp.callback_query(F.data.startswith("gender_"))
+async def gender_callback(cb: types.CallbackQuery):
+    gender = cb.data.split("_")[1]
+    await set_gender(cb.from_user.id, gender)
+    await cb.message.edit_text(
+        f"✅ Gender set to {gender.capitalize()}\n\n"
+        "Use /find to start chatting."
+    )
+    await cb.answer()
+
+# =========================
+# MATCHMAKING CORE
+# =========================
+
+async def find_partner(message: types.Message):
     uid = message.from_user.id
-    pref = parts[1]
-    async with aiosqlite.connect("botdata.db") as db:
-        await db.execute("UPDATE users SET preferred_gender=? WHERE user_id=?", (pref, uid))
-        await db.commit()
-    await message.answer(f"Preferred gender set to {pref}.")
+
+    if uid in active_chats:
+        await message.answer("❗ You are already in a chat.")
+        return
+
+    if uid in user_searching:
+        await message.answer("🔄 Already searching for a partner...")
+        return
+
+    user_searching.add(uid)
+
+    if search_queue:
+        partner = search_queue.pop(0)
+
+        if partner == uid:
+            user_searching.discard(uid)
+            await message.answer("⚠️ Please try again.")
+            return
+
+        active_chats[uid] = partner
+        active_chats[partner] = uid
+
+        user_searching.discard(uid)
+        user_searching.discard(partner)
+
+        await bot.send_message(uid, "✅ Connected to a stranger!")
+        await bot.send_message(partner, "✅ Connected to a stranger!")
+
+    else:
+        search_queue.append(uid)
+        await message.answer("🔍 Searching for a partner...")
+
+# =========================
+# /FIND & /NEXT
+# =========================
 
 @dp.message(Command("find"))
-async def find(message: types.Message):
-    uid = message.from_user.id
-    await user_exists(uid)
-
-    if await is_ghost_banned(uid):
-        await message.answer("🚫 You are temporarily ghost blocked.")
-        return
-
-    if uid in pairs:
-        await message.answer("You’re already in a chat.")
-        return
-
-    if uid in waiting:
-        await message.answer("Already searching…")
-        return
-
-    found = await try_match(uid)
-    if found:
-        await bot.send_message(found, "🔗 Connected to a partner!")
-        await message.answer("🔗 Connected!")
-        return
-
-    waiting.add(uid)
-    await message.answer("🔍 Searching...")
+async def find_cmd(message: types.Message):
+    await find_partner(message)
 
 @dp.message(Command("next"))
 async def next_cmd(message: types.Message):
     uid = message.from_user.id
-    if uid in pairs:
-        p = pairs[uid]
-        del pairs[p]
-        del pairs[uid]
-        await bot.send_message(p, "❌ Partner left chat.")
-        waiting.add(p)
 
-    if uid in waiting:
-        await message.answer("Already searching...")
-        return
+    if uid in active_chats:
+        partner = active_chats.pop(uid)
+        active_chats.pop(partner, None)
 
-    found = await try_match(uid)
-    if found:
-        await bot.send_message(found, "🔗 Connected to new partner!")
-        await message.answer("🔗 Connected!")
-        return
+        # 🔔 rating hook comes later
+        await bot.send_message(uid, "🔁 Finding next partner...")
+        await bot.send_message(partner, "❌ Partner left the chat.")
 
-    waiting.add(uid)
-    await message.answer("🔍 Searching...")
+    await find_partner(message)
+
+# =========================
+# /STOP
+# =========================
 
 @dp.message(Command("stop"))
-async def stop(message: types.Message):
+async def stop_cmd(message: types.Message):
     uid = message.from_user.id
 
-    if uid in pairs:
-        partner = pairs[uid]
-        del pairs[partner]
-        del pairs[uid]
+    if uid in active_chats:
+        partner = active_chats.pop(uid)
+        active_chats.pop(partner, None)
+        await bot.send_message(partner, "❌ Partner left the chat.")
+        await message.answer("🛑 Chat ended.")
+    elif uid in user_searching:
+        user_searching.discard(uid)
+        if uid in search_queue:
+            search_queue.remove(uid)
+        await message.answer("🛑 Search stopped.")
+    else:
+        await message.answer("ℹ️ You are not in a chat.")
 
-        await bot.send_message(partner, "❌ Partner disconnected.")
-        rating_targets[partner] = uid
-        rating_targets[uid] = partner
-        await bot.send_message(partner, "Rate partner: /rate 1–5")
-        await message.answer("Rate partner: /rate 1–5")
-        return
-
-    if uid in waiting:
-        waiting.remove(uid)
-        await message.answer("Stopped searching.")
-        return
-
-    await message.answer("Not in chat.")
-
-@dp.message(lambda m: m.text and m.text.startswith("/rate "))
-async def rate_handler(message: types.Message):
-    parts = message.text.split()
-    if len(parts) != 2:
-        await message.answer("Usage: /rate <1–5>")
-        return
-
-    try:
-        score = int(parts[1])
-    except:
-        await message.answer("Invalid rating.")
-        return
-
-    if score < 1 or score > 5:
-        await message.answer("Rate must be 1–5.")
-        return
-
-    uid = message.from_user.id
-    if uid not in rating_targets:
-        await message.answer("Nothing to rate.")
-        return
-
-    target = rating_targets.pop(uid)
-    await add_rating(target, score)
-    avg = await get_avg_rating(target)
-    await message.answer(f"Thanks for rating! ⭐ {avg:.2f} average.")
-
-@dp.message(Command("myrating"))
-async def myrating(message: types.Message):
-    uid = message.from_user.id
-    avg = await get_avg_rating(uid)
-    await message.answer(f"Your rating: ⭐ {avg:.2f}")
-
-@dp.message(Command("premium"))
-async def premium(message: types.Message):
-    uid = message.from_user.id
-    async with aiosqlite.connect("botdata.db") as db:
-        await db.execute("UPDATE users SET is_premium=1 WHERE user_id=?", (uid,))
-        await db.commit()
-    await message.answer("🎉 You are now a premium user!")
-
-@dp.message(Command("admin"))
-async def admin_panel(message: types.Message):
-    uid = message.from_user.id
-    if uid != 123456789:
-        await message.answer("Unauthorized.")
-        return
-    await message.answer("Admin: /ban /unban /stats /logs")
-
-@dp.message(Command("ban"))
-async def ban_user(message: types.Message):
-    parts = message.text.split()
-    if len(parts) != 2:
-        await message.answer("Usage: /ban <id>")
-        return
-    target = int(parts[1])
-    async with aiosqlite.connect("botdata.db") as db:
-        await db.execute("UPDATE users SET ghost_ban_until=? WHERE user_id=?", (await now_seconds() + 10*365*24*3600, target))
-        await db.commit()
-    await message.answer(f"Banned {target}")
-
-@dp.message(Command("unban"))
-async def unban(message: types.Message):
-    parts = message.text.split()
-    target = int(parts[1])
-    async with aiosqlite.connect("botdata.db") as db:
-        await db.execute("UPDATE users SET ghost_ban_until=0 WHERE user_id=?", (target,))
-        await db.commit()
-    await message.answer(f"Unbanned {target}")
-
-@dp.message(Command("stats"))
-async def stats(message: types.Message):
-    async with aiosqlite.connect("botdata.db") as db:
-        async with db.execute("SELECT COUNT(*) FROM users") as cur:
-            total = await cur.fetchone()
-    await message.answer(f"Total users: {total[0]}")
-
-@dp.message(Command("logs"))
-async def logs(message: types.Message):
-    parts = message.text.split()
-    if len(parts) != 2:
-        await message.answer("Usage: /logs <user_id>")
-        return
-    target = int(parts[1])
-    response = ""
-    async with aiosqlite.connect("botdata.db") as db:
-        async with db.execute("SELECT * FROM chats WHERE user_id=?", (target,)) as cur:
-            rows = await cur.fetchall()
-            for r in rows:
-                response += f"{r[3]} | {r[4]} | {r[5]}\n"
-    if not response: response="No logs."
-    await message.answer(response)
+# =========================
+# MESSAGE RELAY
+# =========================
 
 @dp.message()
 async def relay(message: types.Message):
     uid = message.from_user.id
-    if uid in pairs:
-        partner = pairs[uid]
-        if message.text:
-            if re.search(r"http[s]?://", message.text.lower()):
-                info = await get_user_info(uid)
-                if not info or info[5] == 0:
-                    async with aiosqlite.connect("botdata.db") as db:
-                        await db.execute("INSERT INTO reports(reporter,reported) VALUES(?,?)",(uid,uid))
-                        await db.commit()
-                    if await get_avg_rating(uid)<5: 
-                        await set_ghost_ban(uid)
-                        await message.answer("🚫 Ghost ban: too many links.")
-                        return
-            await log_chat(uid, partner, "text", message.text)
-            await bot.send_message(partner, message.text)
+
+    if uid in active_chats:
+        partner = active_chats[uid]
+
+        # 🔒 admin monitoring hook (later)
+        await bot.send_message(partner, message.text)
+    else:
+        await message.answer("ℹ️ Use /find to start chatting.")
+
+# =========================
+# STARTUP
+# =========================
 
 async def main():
     await init_db()
