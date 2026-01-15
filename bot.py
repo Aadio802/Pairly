@@ -1,179 +1,310 @@
-import os
 import asyncio
-from aiogram import Bot, Dispatcher, types
+import time
+import logging
+import re
+import aiosqlite
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-from database import (
-    init_db,
-    ensure_user,
-    set_gender,
-    get_gender,
-    save_cooldown,
-    recently_matched,
-    add_rating,
-)
+# ─────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = "YOUR_BOT_TOKEN"
+ADMIN_IDS = {123456789}  # replace
+DB_PATH = "pairly.db"
 
-bot = Bot(BOT_TOKEN)
+# ─────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────
+
+logging.basicConfig(level=logging.INFO)
+
+# ─────────────────────────────────────────────
+# DATABASE
+# ─────────────────────────────────────────────
+
+async def db():
+    conn = await aiosqlite.connect(DB_PATH)
+    await conn.execute("PRAGMA journal_mode=WAL;")
+    await conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
+
+
+async def init_db():
+    async with await db() as d:
+        await d.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            gender TEXT,
+            premium_until INTEGER DEFAULT 0,
+            rating_sum INTEGER DEFAULT 0,
+            rating_count INTEGER DEFAULT 0,
+            banned_until INTEGER,
+            created_at INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS matchmaking (
+            user_id INTEGER PRIMARY KEY,
+            partner_id INTEGER,
+            searching INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS ratings (
+            rater INTEGER,
+            rated INTEGER,
+            stars INTEGER
+        );
+        """)
+        await d.commit()
+
+# ─────────────────────────────────────────────
+# BOT SETUP
+# ─────────────────────────────────────────────
+
+bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
-# =========================
-# MEMORY STATE
-# =========================
-queue = []
-chat_pairs = {}
-searching = set()
-pending_ratings = {}  # user_id -> partner_id
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
 
-# =========================
-# START
-# =========================
+async def is_premium(user_id: int) -> bool:
+    async with await db() as d:
+        cur = await d.execute(
+            "SELECT premium_until FROM users WHERE user_id=?",
+            (user_id,)
+        )
+        row = await cur.fetchone()
+        return bool(row and row[0] > time.time())
+
+
+async def get_rating(user_id: int):
+    async with await db() as d:
+        cur = await d.execute(
+            "SELECT rating_sum, rating_count FROM users WHERE user_id=?",
+            (user_id,)
+        )
+        r = await cur.fetchone()
+        if not r or r[1] < 5:
+            return None
+        return round(r[0] / r[1], 1), r[1]
+
+
+def gender_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="♂ Male", callback_data="gender_male")],
+        [InlineKeyboardButton(text="♀ Female", callback_data="gender_female")]
+    ])
+
+
+def rating_kb(user_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{i} ⭐", callback_data=f"rate_{i}_{user_id}")]
+        for i in range(1, 6)
+    ])
+
+# ─────────────────────────────────────────────
+# START / AGREEMENT
+# ─────────────────────────────────────────────
+
 @dp.message(Command("start"))
-async def start(message: types.Message):
-    await ensure_user(message.from_user.id)
-    await message.answer(
-        "👋 Welcome to Pairly\n\n"
-        "Chat anonymously with strangers.\n"
-        "Admins monitor chats.\n\n"
-        "🌟 Premium:\n"
-        "• Better matches\n"
-        "• High-rated users\n"
-        "• Gender preference\n"
-        "• Link sharing\n\n"
-        "Set gender:\n"
-        "/male or /female\n\n"
-        "Use /find to start."
+async def start(msg: types.Message):
+    async with await db() as d:
+        cur = await d.execute(
+            "SELECT user_id FROM users WHERE user_id=?",
+            (msg.from_user.id,)
+        )
+        if await cur.fetchone():
+            await find(msg)
+            return
+
+        await d.execute(
+            "INSERT INTO users (user_id, created_at) VALUES (?, ?)",
+            (msg.from_user.id, int(time.time()))
+        )
+        await d.commit()
+
+    await msg.answer(
+        "👋 <b>Welcome to Pairly</b>\n\n"
+        "• Anonymous chatting\n"
+        "• Possible unfiltered content\n"
+        "• Admin monitoring enabled\n"
+        "• Premium gives better matches\n\n"
+        "By using /find or /next you agree.\n\n"
+        "Select your gender:",
+        reply_markup=gender_kb()
     )
 
-# =========================
-# GENDER
-# =========================
-@dp.message(Command("male"))
-async def male(message: types.Message):
-    await set_gender(message.from_user.id, "male")
-    await message.answer("✅ Gender set to Male.")
 
-@dp.message(Command("female"))
-async def female(message: types.Message):
-    await set_gender(message.from_user.id, "female")
-    await message.answer("✅ Gender set to Female.")
+@dp.callback_query(F.data.startswith("gender_"))
+async def set_gender(cb: types.CallbackQuery):
+    gender = cb.data.split("_")[1]
+    async with await db() as d:
+        await d.execute(
+            "UPDATE users SET gender=? WHERE user_id=?",
+            (gender, cb.from_user.id)
+        )
+        await d.commit()
+    await cb.message.edit_text("✅ Gender saved.\nUse /find to start chatting.")
 
-# =========================
-# FIND / NEXT
-# =========================
+# ─────────────────────────────────────────────
+# MATCHMAKING
+# ─────────────────────────────────────────────
+
 @dp.message(Command("find"))
+async def find(msg: types.Message):
+    uid = msg.from_user.id
+    async with await db() as d:
+        cur = await d.execute(
+            "SELECT partner_id, searching FROM matchmaking WHERE user_id=?",
+            (uid,)
+        )
+        row = await cur.fetchone()
+        if row and row[0]:
+            await msg.answer("You are already in a chat.")
+            return
+        if row and row[1]:
+            await msg.answer("Already searching for a partner…")
+            return
+
+        # find partner
+        cur = await d.execute(
+            "SELECT user_id FROM matchmaking WHERE searching=1 AND user_id!=?",
+            (uid,)
+        )
+        partner = await cur.fetchone()
+
+        if not partner:
+            await d.execute(
+                "INSERT OR REPLACE INTO matchmaking (user_id, searching) VALUES (?, 1)",
+                (uid,)
+            )
+            await d.commit()
+            await msg.answer("🔍 Searching for a partner…")
+            return
+
+        pid = partner[0]
+
+        await d.execute(
+            "UPDATE matchmaking SET partner_id=?, searching=0 WHERE user_id=?",
+            (pid, uid)
+        )
+        await d.execute(
+            "UPDATE matchmaking SET partner_id=?, searching=0 WHERE user_id=?",
+            (uid, pid)
+        )
+        await d.commit()
+
+    rating = await get_rating(pid)
+    text = "🎉 Partner found!"
+    if rating:
+        text += f"\n⭐ {rating[0]} rated by {rating[1]} users"
+
+    await msg.answer(text)
+    await bot.send_message(pid, text)
+
+
 @dp.message(Command("next"))
-async def find(message: types.Message):
-    uid = message.from_user.id
+async def next_chat(msg: types.Message):
+    await end_chat(msg.from_user.id, rate=True)
+    await find(msg)
 
-    if uid in chat_pairs:
-        await message.answer("⚠️ You're already in a chat.")
-        return
 
-    if uid in searching:
-        await message.answer("⏳ Already searching...")
-        return
-
-    if not await get_gender(uid):
-        await message.answer("❗ Set gender first: /male or /female")
-        return
-
-    partner = None
-    for u in queue:
-        if u != uid and not await recently_matched(uid, u):
-            partner = u
-            queue.remove(u)
-            break
-
-    if partner:
-        chat_pairs[uid] = partner
-        chat_pairs[partner] = uid
-        searching.discard(uid)
-        searching.discard(partner)
-
-        await bot.send_message(uid, "🔗 Connected to a stranger!")
-        await bot.send_message(partner, "🔗 Connected to a stranger!")
-    else:
-        queue.append(uid)
-        searching.add(uid)
-        await message.answer("🔍 Searching for a partner...")
-
-# =========================
-# STOP (ENDS CHAT + RATE)
-# =========================
 @dp.message(Command("stop"))
-async def stop(message: types.Message):
-    uid = message.from_user.id
+async def stop(msg: types.Message):
+    await end_chat(msg.from_user.id, rate=True)
+    await msg.answer("❌ Chat ended.")
 
-    if uid not in chat_pairs:
-        await message.answer("⚠️ You're not in a chat.")
+# ─────────────────────────────────────────────
+# MESSAGE RELAY + ADMIN MONITOR
+# ─────────────────────────────────────────────
+
+@dp.message(F.text)
+async def relay(msg: types.Message):
+    uid = msg.from_user.id
+
+    if re.search(r"http|@", msg.text) and not await is_premium(uid):
+        await msg.delete()
+        await msg.answer("🚫 Links are blocked for normal users.")
         return
 
-    partner = chat_pairs.pop(uid)
-    chat_pairs.pop(partner, None)
+    async with await db() as d:
+        cur = await d.execute(
+            "SELECT partner_id FROM matchmaking WHERE user_id=?",
+            (uid,)
+        )
+        row = await cur.fetchone()
 
-    await save_cooldown(uid, partner)
-    await save_cooldown(partner, uid)
-
-    pending_ratings[uid] = partner
-    pending_ratings[partner] = uid
-
-    await bot.send_message(partner, "❌ Stranger left the chat.")
-    await message.answer("❌ Chat ended.\n\nPlease rate your partner:")
-
-    await send_rating_buttons(uid)
-    await send_rating_buttons(partner)
-
-# =========================
-# RATING BUTTONS
-# =========================
-async def send_rating_buttons(user_id):
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="⭐1", callback_data="rate_1"),
-                InlineKeyboardButton(text="⭐2", callback_data="rate_2"),
-                InlineKeyboardButton(text="⭐3", callback_data="rate_3"),
-                InlineKeyboardButton(text="⭐4", callback_data="rate_4"),
-                InlineKeyboardButton(text="⭐5", callback_data="rate_5"),
-            ]
-        ]
-    )
-    await bot.send_message(user_id, "Rate your experience:", reply_markup=kb)
-
-@dp.callback_query(lambda c: c.data.startswith("rate_"))
-async def handle_rating(callback: types.CallbackQuery):
-    rater = callback.from_user.id
-
-    if rater not in pending_ratings:
-        await callback.answer("⚠️ Rating already submitted.", show_alert=True)
+    if not row or not row[0]:
         return
 
-    rating = int(callback.data.split("_")[1])
-    rated_user = pending_ratings.pop(rater)
+    pid = row[0]
+    await bot.send_message(pid, msg.text)
 
-    await add_rating(rated_user, rating)
+    for admin in ADMIN_IDS:
+        await bot.send_message(admin, f"👁 {uid} → {pid}: {msg.text}")
 
-    await callback.message.edit_text("✅ Thanks for rating!")
-    await callback.answer()
+# ─────────────────────────────────────────────
+# CHAT END + RATING
+# ─────────────────────────────────────────────
 
-# =========================
-# RELAY CHAT MESSAGES
-# =========================
-@dp.message()
-async def relay(message: types.Message):
-    uid = message.from_user.id
-    if uid in chat_pairs:
-        await bot.send_message(chat_pairs[uid], message.text)
+async def end_chat(user_id: int, rate=False):
+    async with await db() as d:
+        cur = await d.execute(
+            "SELECT partner_id FROM matchmaking WHERE user_id=?",
+            (user_id,)
+        )
+        row = await cur.fetchone()
+        if not row or not row[0]:
+            return
 
-# =========================
-# MAIN
-# =========================
+        partner = row[0]
+
+        await d.execute(
+            "UPDATE matchmaking SET partner_id=NULL, searching=0 WHERE user_id IN (?, ?)",
+            (user_id, partner)
+        )
+        await d.commit()
+
+    if rate:
+        await bot.send_message(
+            user_id,
+            "Please rate your last partner:",
+            reply_markup=rating_kb(partner)
+        )
+
+# ─────────────────────────────────────────────
+# RATING HANDLER
+# ─────────────────────────────────────────────
+
+@dp.callback_query(F.data.startswith("rate_"))
+async def rate(cb: types.CallbackQuery):
+    _, stars, rated = cb.data.split("_")
+    stars = int(stars)
+    rated = int(rated)
+
+    async with await db() as d:
+        await d.execute(
+            "INSERT INTO ratings VALUES (?, ?, ?)",
+            (cb.from_user.id, rated, stars)
+        )
+        await d.execute(
+            "UPDATE users SET rating_sum = rating_sum + ?, rating_count = rating_count + 1 WHERE user_id=?",
+            (stars, rated)
+        )
+        await d.commit()
+
+    await cb.message.edit_text("⭐ Thanks for your rating!")
+
+# ─────────────────────────────────────────────
+# START BOT
+# ─────────────────────────────────────────────
+
 async def main():
     await init_db()
-    print("🤖 Pairly started")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
