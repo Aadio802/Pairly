@@ -1,95 +1,58 @@
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes
-)
+import asyncio
+import logging
 
-import config
-import database
+from aiogram import Bot, Dispatcher
+from aiogram.enums import ParseMode
+
+from config import BOT_TOKEN
+from database import init_db
+
+from handlers.matchmaking import router as matchmaking_router
+from handlers.messages import router as messages_router
+from handlers.ratings import router as ratings_router
+from handlers.premium import router as premium_router
+from handlers.games import router as games_router
+
+from middlewares.ban_check import BanCheckMiddleware
+from middlewares.spam_guard import SpamGuardMiddleware
 
 
-# ---------- COMMANDS ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    database.add_user(user.id, user.username)
-    await update.message.reply_text(
-        "👋 Welcome!\n\n"
-        "Earn 🌻 Sunflowers, adopt 🐾 pets, maintain 🔥 streaks, and more!\n\n"
-        "Use /daily to start."
+async def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
+    print("✅ Pairly bot booting...")
 
-async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    success, reward = database.claim_daily(user_id)
+    # Initialize database
+    await init_db()
 
-    if not success:
-        await update.message.reply_text("❌ You already claimed today!")
-    else:
-        await update.message.reply_text(
-            f"🔥 Daily claimed!\n"
-            f"You earned 🌻 {reward} sunflowers."
-        )
-
-
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = database.get_user(update.effective_user.id)
-    await update.message.reply_text(
-        f"🌻 Sunflowers: {user[2]}\n"
-        f"🔥 Streak: {user[4]}"
+    bot = Bot(
+        token=BOT_TOKEN,
+        parse_mode=ParseMode.HTML
     )
 
+    dp = Dispatcher()
 
-async def adopt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Usage: /adopt <pet_name>")
-        return
+    # Middlewares
+    dp.message.middleware(BanCheckMiddleware())
+    dp.message.middleware(SpamGuardMiddleware())
 
-    pet_name = " ".join(context.args)
-    database.adopt_pet(update.effective_user.id, pet_name)
-    await update.message.reply_text(f"🐾 You adopted **{pet_name}**!")
+    # Routers
+    dp.include_router(matchmaking_router)
+    dp.include_router(messages_router)
+    dp.include_router(ratings_router)
+    dp.include_router(premium_router)
+    dp.include_router(games_router)
 
+    print("🚀 Pairly bot started successfully")
 
-async def pet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pet = database.get_pet(update.effective_user.id)
-    if not pet:
-        await update.message.reply_text("❌ You don't have a pet yet.")
-    else:
-        await update.message.reply_text(
-            f"🐾 Pet: {pet[0]}\n"
-            f"⭐ Level: {pet[1]}"
-        )
-
-
-async def game(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    import random
-    win = random.choice([True, False])
-    database.record_game(update.effective_user.id, win)
-
-    if win:
-        database.add_sunflowers(update.effective_user.id, 20)
-        await update.message.reply_text("🎮 You WON! +20 🌻")
-    else:
-        await update.message.reply_text("🎮 You lost 😢 Try again!")
-
-
-# ---------- MAIN ----------
-def main():
-    database.setup_database()
-
-    app = ApplicationBuilder().token(config.BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("daily", daily))
-    app.add_handler(CommandHandler("balance", balance))
-    app.add_handler(CommandHandler("adopt", adopt))
-    app.add_handler(CommandHandler("pet", pet))
-    app.add_handler(CommandHandler("game", game))
-
-    print("🤖 Bot is running...")
-    app.run_polling()
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("❌ Pairly bot stopped")
