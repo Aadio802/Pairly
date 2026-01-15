@@ -1,8 +1,9 @@
 import os
 import asyncio
-import time
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
 from database import (
     init_db,
     ensure_user,
@@ -10,6 +11,7 @@ from database import (
     get_gender,
     save_cooldown,
     recently_matched,
+    add_rating,
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -23,6 +25,7 @@ dp = Dispatcher()
 queue = []
 chat_pairs = {}
 searching = set()
+pending_ratings = {}  # user_id -> partner_id
 
 # =========================
 # START
@@ -32,20 +35,16 @@ async def start(message: types.Message):
     await ensure_user(message.from_user.id)
     await message.answer(
         "👋 Welcome to Pairly\n\n"
-        "Here you can chat anonymously with strangers.\n"
-        "You may encounter unfiltered content.\n\n"
-        "🌟 Premium gives:\n"
+        "Chat anonymously with strangers.\n"
+        "Admins monitor chats.\n\n"
+        "🌟 Premium:\n"
         "• Better matches\n"
-        "• High-rated partners\n"
+        "• High-rated users\n"
         "• Gender preference\n"
-        "• Faster matching\n\n"
-        "🌻 Earn Sunflowers by:\n"
-        "• Good ratings\n"
-        "• Streaks\n"
-        "• Games\n\n"
-        "Set your gender:\n"
+        "• Link sharing\n\n"
+        "Set gender:\n"
         "/male or /female\n\n"
-        "Use /find to start chatting."
+        "Use /find to start."
     )
 
 # =========================
@@ -69,22 +68,18 @@ async def female(message: types.Message):
 async def find(message: types.Message):
     uid = message.from_user.id
 
-    # Already chatting
     if uid in chat_pairs:
-        await message.answer("⚠️ You are already in a chat. Use /next or /stop.")
+        await message.answer("⚠️ You're already in a chat.")
         return
 
-    # Already searching
     if uid in searching:
-        await message.answer("⏳ Already searching for a partner.")
+        await message.answer("⏳ Already searching...")
         return
 
-    gender = await get_gender(uid)
-    if not gender:
-        await message.answer("❗ Please set your gender first: /male or /female")
+    if not await get_gender(uid):
+        await message.answer("❗ Set gender first: /male or /female")
         return
 
-    # Try to match
     partner = None
     for u in queue:
         if u != uid and not await recently_matched(uid, u):
@@ -106,49 +101,79 @@ async def find(message: types.Message):
         await message.answer("🔍 Searching for a partner...")
 
 # =========================
-# STOP
+# STOP (ENDS CHAT + RATE)
 # =========================
 @dp.message(Command("stop"))
 async def stop(message: types.Message):
     uid = message.from_user.id
 
-    if uid in chat_pairs:
-        partner = chat_pairs.pop(uid)
-        chat_pairs.pop(partner, None)
-
-        await save_cooldown(uid, partner)
-        await save_cooldown(partner, uid)
-
-        await bot.send_message(partner, "❌ Stranger has left the chat.")
-        await message.answer("❌ Chat ended.")
+    if uid not in chat_pairs:
+        await message.answer("⚠️ You're not in a chat.")
         return
 
-    if uid in searching:
-        searching.discard(uid)
-        if uid in queue:
-            queue.remove(uid)
-        await message.answer("❌ Stopped searching.")
-        return
+    partner = chat_pairs.pop(uid)
+    chat_pairs.pop(partner, None)
 
-    await message.answer("⚠️ You are not in a chat.")
+    await save_cooldown(uid, partner)
+    await save_cooldown(partner, uid)
+
+    pending_ratings[uid] = partner
+    pending_ratings[partner] = uid
+
+    await bot.send_message(partner, "❌ Stranger left the chat.")
+    await message.answer("❌ Chat ended.\n\nPlease rate your partner:")
+
+    await send_rating_buttons(uid)
+    await send_rating_buttons(partner)
 
 # =========================
-# RELAY MESSAGES
+# RATING BUTTONS
+# =========================
+async def send_rating_buttons(user_id):
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="⭐1", callback_data="rate_1"),
+                InlineKeyboardButton(text="⭐2", callback_data="rate_2"),
+                InlineKeyboardButton(text="⭐3", callback_data="rate_3"),
+                InlineKeyboardButton(text="⭐4", callback_data="rate_4"),
+                InlineKeyboardButton(text="⭐5", callback_data="rate_5"),
+            ]
+        ]
+    )
+    await bot.send_message(user_id, "Rate your experience:", reply_markup=kb)
+
+@dp.callback_query(lambda c: c.data.startswith("rate_"))
+async def handle_rating(callback: types.CallbackQuery):
+    rater = callback.from_user.id
+
+    if rater not in pending_ratings:
+        await callback.answer("⚠️ Rating already submitted.", show_alert=True)
+        return
+
+    rating = int(callback.data.split("_")[1])
+    rated_user = pending_ratings.pop(rater)
+
+    await add_rating(rated_user, rating)
+
+    await callback.message.edit_text("✅ Thanks for rating!")
+    await callback.answer()
+
+# =========================
+# RELAY CHAT MESSAGES
 # =========================
 @dp.message()
 async def relay(message: types.Message):
     uid = message.from_user.id
-
     if uid in chat_pairs:
-        partner = chat_pairs[uid]
-        await bot.send_message(partner, message.text)
+        await bot.send_message(chat_pairs[uid], message.text)
 
 # =========================
 # MAIN
 # =========================
 async def main():
     await init_db()
-    print("🤖 Bot started")
+    print("🤖 Pairly started")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
